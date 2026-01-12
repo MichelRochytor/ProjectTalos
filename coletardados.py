@@ -39,18 +39,26 @@ def coletar_dados():
         return
 
     # 1. Coleta os dados do dia (Intervalo de 1 minuto)
-    print(f"📡 Baixando dados intraday de {ATIVO} via Yahoo Finance...")
     try:
-        # Tenta baixar. Se falhar, tenta de novo após 5 segundos
         df = yf.download(ATIVO, period="1d", interval="1m", progress=False)
-        if df.empty:
-            print("⚠️ Yahoo retornou dados vazios (Talvez feriado ou pré-market).")
-            return
     except Exception as e:
-        print(f"[ERRO] Falha no yfinance: {e}")
+        print(f"Erro no Yahoo: {e}")
         return
 
-    # 2. Tratamento de Dados
+    if df.empty:
+        print("Yahoo veio vazio.")
+        return
+
+    # --- CORREÇÃO DE FUSO HORÁRIO (COPIE DAQUI) ---
+    # Se o índice não tiver fuso, assume UTC e converte para São Paulo
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
+    
+    # Converte para o horário do Brasil
+    df.index = df.index.tz_convert('America/Sao_Paulo')
+    # ---------------------------------------------
+
+    # 2. Prepara os dados (Agora com o horário certo)
     df.reset_index(inplace=True)
     
     # Tratamento de Data/Hora (converte para string compatível com Sheets)
@@ -90,5 +98,10 @@ def coletar_dados():
     except Exception as e:
         print(f"[ERRO] Falha ao salvar linhas: {e}")
 
+def main():
+    while True:
+        coletar_dados()
+        time.sleep(60)  # Aguarda 1 minuto antes de coletar novamente
+
 if __name__ == "__main__":
-    coletar_dados()
+    main()
