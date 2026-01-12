@@ -9,99 +9,111 @@ import time
 
 # --- CONFIGURAÇÕES DO TALOS ---
 ATIVO = "PETR4.SA"
-NOME_PLANILHA = "TALOS_DATASET" # Nome exato da planilha no Google Drive
-ARQUIVO_CREDS = "creds.json"    # Arquivo de chave que você subiu para a VM
+NOME_PLANILHA = "TALOS_DATASET"
+ARQUIVO_CREDS = "creds.json"
 
 def conectar_sheets():
     """Autentica no Google Cloud e conecta à planilha."""
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    
     try:
         creds = ServiceAccountCredentials.from_json_keyfile_name(ARQUIVO_CREDS, scope)
         client = gspread.authorize(creds)
         sheet = client.open(NOME_PLANILHA).sheet1
         return sheet
     except Exception as e:
-        print(f"[ERRO] Falha na autenticação do Google Sheets: {e}")
-        print("DICA: Verifique se você compartilhou a planilha com o e-mail do arquivo JSON.")
-        sys.exit()
+        print(f"[ERRO CRÍTICO] Falha na autenticação: {e}")
+        # Se falhar a conexão, não mata o programa, espera e tenta de novo na próxima
+        return None
 
 def coletar_dados():
     # Define Fuso Horário de Brasília
     tz = pytz.timezone("America/Sao_Paulo")
     agora = datetime.now(tz)
     
-    print(f"\n--- INICIANDO TALOS COLLECTOR: {agora.strftime('%d/%m/%Y %H:%M:%S')} ---")
+    print(f"\n--- TALOS CHECK: {agora.strftime('%H:%M:%S')} ---")
 
-    # Verifica se é fim de semana (Sábado=5, Domingo=6)
+    # Verifica fim de semana
     if agora.weekday() > 4:
-        print("Hoje é fim de semana. Mercado fechado. Encerrando.")
+        print("Fim de semana. Mercado fechado.")
         return
 
-    # 1. Coleta os dados do dia (Intervalo de 1 minuto)
+    # 1. Coleta os dados do dia
     try:
+        # Baixa o dia todo para garantir que pegamos o último candle fechado
         df = yf.download(ATIVO, period="1d", interval="1m", progress=False)
     except Exception as e:
         print(f"Erro no Yahoo: {e}")
         return
 
     if df.empty:
-        print("Yahoo veio vazio.")
+        print("Yahoo retornou vazio (aguardando abertura ou dados).")
         return
 
-    # --- CORREÇÃO DE FUSO HORÁRIO (COPIE DAQUI) ---
-    # Se o índice não tiver fuso, assume UTC e converte para São Paulo
+    # --- CORREÇÃO DE FUSO HORÁRIO ---
     if df.index.tz is None:
         df.index = df.index.tz_localize('UTC')
-    
-    # Converte para o horário do Brasil
     df.index = df.index.tz_convert('America/Sao_Paulo')
-    # ---------------------------------------------
+    # --------------------------------
 
-    # 2. Prepara os dados (Agora com o horário certo)
+    # 2. Tratamento de Dados
     df.reset_index(inplace=True)
     
-    # Tratamento de Data/Hora (converte para string compatível com Sheets)
-    if 'Datetime' in df.columns:
-        df['DataHora'] = df['Datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
-    elif 'Date' in df.columns:
-        df['DataHora'] = df['Date'].astype(str)
+    # Padroniza DataHora como String YYYY-MM-DD HH:MM:SS
+    col_data = 'Datetime' if 'Datetime' in df.columns else 'Date'
+    if col_data in df.columns:
+        df['DataHora'] = df[col_data].dt.strftime('%Y-%m-%d %H:%M:%S')
     else:
         df['DataHora'] = df.index.strftime('%Y-%m-%d %H:%M:%S')
 
-    # Organiza as colunas e remove dados desnecessários
-    # Adicionamos uma coluna vazia 'MANUAL_LABEL' para você preencher depois
     cols_finais = ['DataHora', 'Open', 'High', 'Low', 'Close', 'Volume']
     df_limpo = df[cols_finais].copy()
-    
-    # Adiciona coluna para o Gabarito (0 = Neutro, 1 = Compra, 2 = Venda)
     df_limpo['TARGET_MANUAL'] = "" 
 
-    # Converte para lista de listas (formato que o Gspread aceita)
-    dados_matriz = df_limpo.values.tolist()
-
-    # 3. Envio para a Nuvem
-    print("☁️ Conectando ao Google Sheets...")
+    # 3. LÓGICA ANTI-DUPLICIDADE (O SEGREDO)
     sheet = conectar_sheets()
-    
-    # Se a planilha estiver vazia, cria o cabeçalho
-    if len(sheet.get_all_values()) == 0:
-        cabecalho = cols_finais + ['TARGET_MANUAL']
-        sheet.append_row(cabecalho)
-        print("📝 Cabeçalho criado com sucesso.")
+    if not sheet: return # Se a conexão falhou, tenta na próxima volta
 
-    print(f"📤 Enviando {len(dados_matriz)} linhas de dados...")
+    todos_dados = sheet.get_all_values()
     
-    try:
-        sheet.append_rows(dados_matriz)
-        print(f"✅ SUCESSO! Dados de {agora.strftime('%d/%m/%Y')} salvos.")
-    except Exception as e:
-        print(f"[ERRO] Falha ao salvar linhas: {e}")
+    # Se a planilha já tem dados (tem cabeçalho + linhas)
+    if len(todos_dados) > 1:
+        # Pega a data da última linha (coluna 0 é a DataHora)
+        ultima_data_sheet = todos_dados[-1][0]
+        print(f"Último registro na nuvem: {ultima_data_sheet}")
+        
+        # Filtra: Só quero o que for MAIOR (mais novo) que a última data
+        # Isso evita duplicar o que já está lá
+        df_para_enviar = df_limpo[df_limpo['DataHora'] > ultima_data_sheet]
+        
+    else:
+        # Planilha vazia ou só cabeçalho
+        if len(todos_dados) == 0:
+            cabecalho = cols_finais + ['TARGET_MANUAL']
+            sheet.append_row(cabecalho)
+            print("Cabeçalho criado.")
+        
+        df_para_enviar = df_limpo
+
+    # 4. Envia apenas o Delta (a diferença)
+    qtd_novas = len(df_para_enviar)
+    
+    if qtd_novas > 0:
+        dados_matriz = df_para_enviar.values.tolist()
+        try:
+            sheet.append_rows(dados_matriz)
+            print(f"✅ SUCESSO! {qtd_novas} novas linhas adicionadas.")
+        except Exception as e:
+            print(f"[ERRO] Ao salvar no Sheets: {e}")
+    else:
+        print("⏸️ Sem dados novos no Yahoo por enquanto.")
 
 def main():
+    print("--- 🛡️ TALOS MONITOR RODANDO ---")
+    print("Pressione Ctrl+C para parar.")
     while True:
         coletar_dados()
-        time.sleep(60)  # Aguarda 1 minuto antes de coletar novamente
+        # Espera 60 segundos antes de checar de novo
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
